@@ -1,11 +1,11 @@
 # MAGRO Database Design
 
 **Project:** MAGRO — Municipal Agriculture Management and Decision Support System  
-**Status:** Draft for review — not approved for implementation  
+**Status:** Updated logical design — planning decisions recorded; migrations not yet authorized  
 **Stack assumption:** PostgreSQL + PostGIS, accessed through a Laravel backend  
 **Purpose:** Define the proposed data model before application code is written.
 
-> This is a logical design, not a final migration script. Confirm the open decisions at the end before treating this as an implementation contract. Do not store real farmer information in development or test data.
+> This is a logical design, not a migration script. Decisions recorded in `decision-log.md` supersede older undecided notes in this draft. Do not store real farmer information in development or test data.
 
 ## 1. Design principles
 
@@ -19,6 +19,7 @@
 8. Treat sensor values as observations and advisories. The system must not automatically operate irrigation equipment.
 9. Keep hosting, SMS provider, and hardware message transport details configurable; do not bake a provider into the data model.
 10. Avoid hard deletion of operational records where it would break history or auditability. Use archival or soft deletion only where the retention policy permits it.
+11. Support extended offline mode through an explicit sync queue, local IDs, idempotency keys, conflict versions, and server-side permission revalidation.
 
 ## 2. Relationship overview
 
@@ -125,8 +126,8 @@ Add a spatial index for `boundary_geom`. Confirm the official barangay boundary 
 
 #### `farmers`
 - `id` — primary key
-- `system_id` — unique, permanent human-readable MAGRO farmer ID
-- `rsbsa_number` — nullable or required only after policy confirmation; indexed and normalized for comparison
+- `system_id` — unique, permanent human-readable MAGRO farmer ID in `MAG-YYYY-000001` format
+- `rsbsa_number` — required before registration is completed; normalized and indexed for duplicate checking
 - `first_name`, `middle_name` — nullable where appropriate, `last_name`, `suffix`
 - `birth_date` — nullable if not required
 - `sex` — only if required by approved forms/reporting
@@ -153,7 +154,7 @@ Keep `system_id` stable even if the farmer's name, address, phone, or RSBSA deta
 - `created_by_user_id`, `updated_by_user_id`
 - timestamps
 
-A farmer may have multiple farms. Confirm whether one farm can have multiple co-owners/operators; if so, add a `farm_participants` association table rather than storing only one `farmer_id`.
+A farmer may have multiple farms; each farm belongs to exactly one registered farmer under the current scope. No co-owner/operator association is required in this baseline.
 
 #### `crops`
 - `id` — primary key
@@ -176,7 +177,7 @@ A historical record of a crop on a farm, rather than a single mutable crop field
 - `recorded_by_user_id` — FK to `users`
 - timestamps
 
-Validate that end dates do not precede start dates. Confirm whether the system needs a separate crop-season calendar and whether multiple crops can be recorded for the same farm and season.
+Validate that end dates do not precede start dates. Preserve each crop-season record as history. Validate date order; keep actual activity dates separate from local creation and server synchronization timestamps. A separate season master can be added if the municipality supplies a stable season calendar.
 
 ### 3.3 Programs, eligibility, applications, and assistance
 
@@ -498,46 +499,67 @@ Confirm the official ICDI expansion, benchmark source, time period, geographic c
 - Use synthetic test records only, with fake names, phone numbers, RSBSA values, and coordinates.
 - Backups need access controls, encryption, integrity checks, and tested restore procedures. A backup is not verified until a restore test succeeds.
 
-## 7. Decisions required before implementation
+## 7. Decision status
 
-Do not silently decide these points. Record the chosen answer in the architecture/requirements documents:
+Use `decision-log.md` as the source of truth for decisions already recorded. Earlier open-decision lists and checklist text in this draft are superseded by the current requirements, architecture, and decision log. Do not treat legacy wording in entity notes as a reason to reopen a decision that is already recorded. Source-specific blockers that remain must be validated before the affected feature is released.
 
-1. **Farmer ID:** required format, generation method, and whether it must be human-readable.
-2. **RSBSA:** whether it is required, normalization rules, and whether duplicates are ever allowed.
-3. **Farmer/farm ownership:** whether farms can have multiple owners or operators.
-4. **Crop history:** whether seasons are a separate managed entity and whether planted/harvested dates and crop area are mandatory.
-5. **Application workflow:** exact statuses, allowed transitions, meaning of returned versus rejected, who can approve, and the definition of self-approval.
-6. **Eligibility:** supported rule fields/operators, who may edit/approve rules, and how historical rule versions are retained.
-7. **Intervention definition:** whether an intervention means approved, scheduled, delivered, or any of these as separate event types.
-8. **Assistance gap rules:** rule scope, duration units, effective dates, and what counts as a previous assistance event.
-9. **IoT:** supported sensor metrics and units, calibration procedure, sampling interval, retention, device identity, authentication, and duplicate-reading strategy.
-10. **Alerts:** threshold owners, severity levels, human-review roles, escalation, and what action can trigger an SMS.
-11. **SMS:** provider and hardware integration, sender identity, consent/notice and opt-out policy, retry rules, reply matching, costs, and message retention.
-12. **GIS:** authoritative barangay boundaries, coordinate reference system, import/export requirements, location precision, and who may see precise coordinates.
-13. **Coverage:** whether denominator means eligible farmers or target farmers, the meaning of “served,” and reporting period boundaries.
-14. **ICDI:** official definition, benchmark source, comparison scope, and handling of unavailable data.
-15. **Documents:** allowed file types, size limits, retention, malware scanning, and access rules.
-16. **Users and permissions:** final roles, permission matrix, and whether a user can hold multiple roles.
-17. **Audit and privacy:** retention periods, sensitive fields to redact, and which reads/exports require audit events.
-18. **Backups:** backup frequency, retention, encryption, storage location, and who can initiate/approve restoration.
+## 10. Extended offline synchronization data model (required)
 
-## 8. Review checklist
+The following logical entities are required to implement the approved extended offline mode. Final physical fields and constraints should be reviewed before migrations are written.
 
-Before marking this design approved:
+### `sync_batches`
+- `id` UUID primary key and idempotency key
+- `user_id` FK to the authenticated staff user
+- `device_installation_id` or client instance identifier (non-secret, revocable)
+- `started_at`, `completed_at`, `status` (queued, processing, completed, partial, failed)
+- counts for accepted, rejected, duplicate-flagged, and conflict-pending records
+- safe error summary and correlation ID
 
-- [ ] Requirements and architecture documents match this data model.
-- [ ] Farmer/farm/crop history is preserved rather than overwritten.
-- [ ] Applications have a defined workflow and auditable decisions.
-- [ ] Delivered assistance is distinct from approval.
-- [ ] Eligibility and gap rules are configurable and versioned.
-- [ ] Sensor observations, internal alerts, human review, and farmer SMS are separate steps.
-- [ ] GIS access controls cover map display, query endpoints, and exports.
-- [ ] Coverage and ICDI formulas and source data are approved.
-- [ ] SMS matching and bulk-send safety rules are approved.
-- [ ] Role/permission matrix, audit retention, and backup/restore process are approved.
-- [ ] Indexes and deletion behavior are reviewed.
-- [ ] No application feature implementation has started before the verification plan is agreed.
+### `sync_items`
+- `id` UUID primary key; `sync_batch_id` FK
+- `entity_type`, `local_record_id`, nullable `server_record_id`
+- `operation` (create/update), `idempotency_key`, `client_version`, `base_server_version`
+- `payload_hash`, `status` (queued, accepted, rejected, conflict, needs_review)
+- `validation_errors` JSONB, `received_at`, `processed_at`
+- unique constraint on idempotency key; never store authentication secrets in the payload
 
-## 9. Next step
+### `record_versions` / conflict records
+- Keep the server version and submitted client version or immutable snapshots of conflicting fields
+- Include entity reference, field-level conflict description, detected time, resolution status, resolver user, resolution time, and selected/merged outcome
+- Unresolved conflicts remain pending; resolution is audited. Never silently overwrite a concurrent server edit.
 
-Review this document and copy it to `docs/database.md` in the repository. Do not create migrations or application features yet. After this document is committed, review the unresolved decisions, then define the verification plan and acceptance checks before starting implementation.
+### Local identifiers and permanent identifiers
+- Every offline-created record receives a globally unique client-generated local UUID. Retain it as a stable external/client identifier after sync.
+- The server assigns the permanent Farmer ID `MAG-YYYY-000001` using a concurrency-safe sequence scoped to registration year. Local IDs and RSBSA numbers remain separate.
+- Retry-safe idempotency prevents repeated synchronization from creating duplicate records.
+
+### Draft handling
+- Offline applications synchronize as drafts and require online review/submission.
+- Offline intervention records synchronize as drafts and require authorized online confirmation before entering official assistance history.
+- Farmer/farm/crop records may synchronize automatically after server-side validation, permission checks, duplicate checks, and conflict detection.
+- Event date, local creation timestamp, server receipt timestamp, and synchronization timestamp are distinct fields where relevant.
+
+### Offline security and lifecycle
+- Local cache is scoped to the signed-in user and protected by platform-appropriate encryption and lock/expiry controls.
+- Cache expiry is configurable by Administrator. Expiry cannot silently delete pending changes; recovery must be explicit and authorized.
+- On sign-out with pending work, warn the user and preserve encrypted pending changes inaccessible to other users until the same user returns or authorized recovery occurs.
+- The server rechecks permissions on every sync operation. Revoked permissions cannot be bypassed by stale cached access.
+
+## 11. Confirmed policy decisions and remaining blockers
+
+The project decision log is the source of truth for farmer ID and RSBSA rules, one-farmer-per-farm relationship, application workflow, versioned eligibility, assistance gap policy, IoT alerts, SMS retries/replies, GIS privacy, imports, backups, RBAC, archival, analytics scope, hosting, and offline behavior. Do not retain older statements in this draft that say those topics are undecided.
+
+Do not guess the official ICDI formula. Before implementing that metric, locate the approved project/source definition and document rounding, benchmark, reporting scope, and zero-denominator behavior. Other production blockers include official GIS boundary/CRS data, validated IoT protocol and calibration parameters, actual SIM800L inbound/delivery-status capabilities, municipal server readiness, and approved retention/recovery targets.
+
+## 12. Database review checklist
+
+- [ ] Permanent Farmer ID uses `MAG-YYYY-000001`; RSBSA is required before registration completion and duplicate matches are flagged, never silently merged.
+- [ ] Each farm belongs to one farmer; multiple farms per farmer and historical crop seasons are supported.
+- [ ] Approval is distinct from delivery; official interventions are preserved as history.
+- [ ] Eligibility rules are versioned and prior-assistance checks are configurable.
+- [ ] Valid sensor threshold crossings can trigger configured SMS; invalid readings/outages cannot.
+- [ ] Role permissions protect precise GIS data across API, search, reports, and exports.
+- [ ] Backup/restore and archival behavior is auditable.
+- [ ] Sync IDs, idempotency, conflict preservation, draft workflows, cache lifecycle, and server-side permission checks are supported.
+- [ ] No real farmer data or credentials appear in development fixtures.
+- [ ] ICDI remains blocked until the official formula is sourced.
